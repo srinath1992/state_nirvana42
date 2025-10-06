@@ -357,8 +357,9 @@ class Inference:
                 )
 
                 ds_emb = cell_embeds_batch[:, -self.model.z_dim_ds :]  # last ten columns are the dataset embeddings
+                cell_embeds_batch_core = cell_embeds_batch[:, :-self.model.z_dim_ds] if self.model.z_dim_ds > 0 else cell_embeds_batch  # Remove ds_emb before passing to resize_batch
                 merged_embs = StateEmbeddingModel.resize_batch(
-                    cell_embeds_batch, gene_embeds, task_counts=task_counts, ds_emb=ds_emb
+                    cell_embeds_batch_core, gene_embeds, task_counts=task_counts, ds_emb=ds_emb
                 )
                 logprobs_batch = self.model.binary_decoder(merged_embs)
                 logprobs_batch = logprobs_batch.detach().cpu().float().numpy()
