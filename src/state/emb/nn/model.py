@@ -29,10 +29,11 @@ from .loss import WassersteinLoss, KLDivergenceLoss, MMDLoss, TabularLoss
 
 from .flash_transformer import FlashTransformerEncoderLayer
 from .flash_transformer import FlashTransformerEncoder
+from .flash_transformer import AdapterLayerNorm
 
 
 class SkipBlock(nn.Module):
-    def __init__(self, in_features):
+    def __init__(self, in_features, old_d_model: int | None = None):
         """
         Given input X of size in_features
         - out = layernorm(x + MLP(MLP(X))
@@ -43,7 +44,10 @@ class SkipBlock(nn.Module):
         self.intermediate_dense = nn.Linear(in_features, in_features * 2, bias=True)
         self.dense = nn.Linear(in_features * 2, in_features, bias=True)
         self.activation = nn.ReLU()
-        self.layer_norm = nn.LayerNorm(in_features)
+        if old_d_model is not None and old_d_model < in_features:
+            self.layer_norm = AdapterLayerNorm(in_features, old_d_model)
+        else:
+            self.layer_norm = nn.LayerNorm(in_features)
 
     def forward(self, x):
         residual = x
@@ -90,14 +94,18 @@ class StateEmbeddingModel(L.LightningModule):
         self.max_lr = max_lr
         self.collater = collater
         # Encodes Tokens
-        self.encoder = nn.Sequential(
+        # Encoder block with optional LN adapter to preserve old LN stats when widened
+        old_d_model = min(d_model, 2048)
+        encoder_layers = [
             nn.Linear(token_dim, d_model, bias=True),
-            nn.LayerNorm(d_model),  # Moved before activation
-            nn.SiLU(),  # Changed to SiLU
-        )
+            AdapterLayerNorm(d_model, old_d_model) if old_d_model < d_model else nn.LayerNorm(d_model),
+            nn.SiLU(),
+        ]
+        self.encoder = nn.Sequential(*encoder_layers)
 
         # Create a list of FlashTransformerEncoderLayer instances
-        layers = [FlashTransformerEncoderLayer(d_model, nhead, d_hid, dropout=dropout) for _ in range(nlayers)]
+        old_d_model = min(d_model, 2048)
+        layers = [FlashTransformerEncoderLayer(d_model, nhead, d_hid, dropout=dropout, old_d_model=old_d_model) for _ in range(nlayers)]
         self.transformer_encoder = FlashTransformerEncoder(layers)
 
         if compiled:
@@ -107,7 +115,7 @@ class StateEmbeddingModel(L.LightningModule):
         self.dropout = dropout
 
         self.decoder = nn.Sequential(
-            SkipBlock(d_model),
+            SkipBlock(d_model, old_d_model=old_d_model),
             nn.Linear(d_model, output_dim, bias=True),
         )
 
@@ -118,10 +126,12 @@ class StateEmbeddingModel(L.LightningModule):
         self.z_dim_ds = 10 if self.cfg.model.get("dataset_correction", False) else 0
         self.z_dim = self.z_dim_rd + self.z_dim_ds
 
+        old_concat = output_dim + old_d_model + self.z_dim
+        new_concat = output_dim + d_model + self.z_dim
         self.binary_decoder = nn.Sequential(
-            SkipBlock(output_dim + d_model + self.z_dim),
-            SkipBlock(output_dim + d_model + self.z_dim),
-            nn.Linear(output_dim + d_model + self.z_dim, 1, bias=True),
+            SkipBlock(new_concat, old_d_model=old_concat),
+            SkipBlock(new_concat, old_d_model=old_concat),
+            nn.Linear(new_concat, 1, bias=True),
         )
 
         if self.cfg.model.counts:
