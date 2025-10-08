@@ -20,30 +20,47 @@ class AdapterLayerNorm(nn.Module):
         super().__init__()
         self.d_model = d_model
         self.old_d_model = old_d_model
-        self.down = nn.Linear(d_model, old_d_model, bias=False)
+        # Inner LayerNorm over the original subspace
         self.ln = nn.LayerNorm(old_d_model)
-        self.up = nn.Linear(old_d_model, d_model, bias=False)
 
-        # Initialize down as selector of first old_d_model features
-        with torch.no_grad():
-            self.down.weight.zero_()
-            for i in range(old_d_model):
-                self.down.weight[i, i] = 1.0
-
-            # Initialize up as identity on first old_d_model and duplicate for extra dims
-            self.up.weight.zero_()
-            for i in range(old_d_model):
-                self.up.weight[i, i] = 1.0
-
-            dup_map = _build_duplication_map(old_d_model, d_model)
-            for idx, src in enumerate(dup_map):
-                self.up.weight[old_d_model + idx, src] = 1.0
+        # Cache duplication mapping for new dims → source old-dim index
+        dup_map = _build_duplication_map(old_d_model, d_model)
+        # store as buffer for device/dtype placement
+        self.register_buffer("_dup_src_idx", torch.tensor(dup_map, dtype=torch.long))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = self.down(x)
-        y = self.ln(y)
-        z = self.up(y)
-        return z
+        # Compute LN statistics over only the original subspace
+        x_old = x[..., : self.old_d_model]
+        # Use the nn.LayerNorm module to normalize the old subspace
+        norm_old = self.ln(x_old)
+
+        # Reconstruct full-dim normalized output by tiling the normalized old features
+        if self.d_model == self.old_d_model:
+            return norm_old
+
+        # Build full weight/bias-expanded affine once per forward (small)
+        w = self.ln.weight
+        b = self.ln.bias
+
+        # Start with zeros and fill
+        out = x.clone()
+
+        # Compute mean/var over old dims and apply to ALL dims so residual/new dims use same stats
+        mu = x_old.mean(dim=-1, keepdim=True)
+        var = x_old.var(dim=-1, unbiased=False, keepdim=True)
+        x_norm = (x - mu) / torch.sqrt(var + self.ln.eps)
+
+        # Affine for old dims
+        out_old = x_norm[..., : self.old_d_model] * w + b
+
+        # Affine for new dims: replicate source indices' (w, b)
+        if self._dup_src_idx.numel() > 0:
+            w_new = w[self._dup_src_idx]
+            b_new = b[self._dup_src_idx]
+            out_new = x_norm[..., self.old_d_model :].mul(w_new).add(b_new)
+            return torch.cat([out_old, out_new], dim=-1)
+        else:
+            return out_old
 
 
 class FlashTransformerEncoderLayer(nn.Module):
@@ -66,6 +83,13 @@ class FlashTransformerEncoderLayer(nn.Module):
         # Linear projections for Q, K, V in one matrix
         self.qkv_proj = nn.Linear(d_model, d_model * 3)
         self.out_proj = nn.Linear(d_model, d_model)
+
+        # Residual gates to keep new dims off at initialization
+        self.old_d_model = old_d_model if old_d_model is not None else d_model
+        gate_init = torch.ones(d_model)
+        if self.old_d_model < d_model:
+            gate_init[self.old_d_model:] = 0.0
+        self.register_buffer("gate_mask", gate_init)
 
         # LayerNorms (optionally adapter-wrapped to preserve old_d_model statistics)
         if old_d_model is not None and old_d_model < d_model:
@@ -106,16 +130,22 @@ class FlashTransformerEncoderLayer(nn.Module):
         k = k.view(src.size(0), src.size(1), self.nhead, head_dim).transpose(1, 2)
         v = v.view(src.size(0), src.size(1), self.nhead, head_dim).transpose(1, 2)
 
+        # Note: Avoid per-subspace Q/K amplitude tweaks; prior experiments degraded locality.
+
         # Use PyTorch’s built-in scaled_dot_product_attention.
         attn_output = F.scaled_dot_product_attention(q, k, v, dropout_p=self.dropout, is_causal=False)
         # Merge heads.
         attn_output = attn_output.transpose(1, 2).contiguous().view(src.size(0), src.size(1), self.d_model)
         attn_output = self.out_proj(attn_output)
+        # Gate new dimensions off at init to preserve residual behavior
+        attn_output = attn_output * self.gate_mask
         src = self.norm1(residual + self.dropout_layer(attn_output))
 
         # ----- Feed-Forward Block -----
         residual2 = src
         ff_output = self.linear2(self.dropout_layer(F.gelu(self.linear1(src))))
+        # Gate new dimensions off at init to preserve residual behavior
+        ff_output = ff_output * self.gate_mask
         src = self.norm2(residual2 + self.dropout_layer(ff_output))
         return src
 
