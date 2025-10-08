@@ -164,9 +164,9 @@ class Inference:
 
     def get_gene_embedding(self, genes):
         protein_embeds = [self.protein_embeds[x] if x in self.protein_embeds else torch.zeros(5120) for x in genes]
-        device_type = "cuda" if torch.cuda.is_available() else "cpu"
-        precision = get_precision_config(device_type=device_type)
-        protein_embeds = torch.stack(protein_embeds).to(self.model.device, dtype=precision)
+        # Align input dtype with layer weights to avoid matmul dtype mismatch (e.g., BF16 vs FP32)
+        layer_weight_dtype = self.model.gene_embedding_layer[0].weight.dtype  # Linear weight dtype
+        protein_embeds = torch.stack(protein_embeds).to(self.model.device, dtype=layer_weight_dtype)
         return self.model.gene_embedding_layer(protein_embeds)
 
     def encode(self, dataloader, rda=None):
