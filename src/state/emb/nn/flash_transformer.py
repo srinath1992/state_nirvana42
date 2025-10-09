@@ -140,6 +140,8 @@ class FlashTransformerEncoderLayer(nn.Module):
         # Gate new dimensions off at init to preserve residual behavior
         attn_output = attn_output * self.gate_mask
         src = self.norm1(residual + self.dropout_layer(attn_output))
+        # Keep widened dims strictly zero on the residual stream at init
+        src = src * self.gate_mask
 
         # ----- Feed-Forward Block -----
         residual2 = src
@@ -147,6 +149,8 @@ class FlashTransformerEncoderLayer(nn.Module):
         # Gate new dimensions off at init to preserve residual behavior
         ff_output = ff_output * self.gate_mask
         src = self.norm2(residual2 + self.dropout_layer(ff_output))
+        # Keep widened dims strictly zero on the residual stream at init
+        src = src * self.gate_mask
         return src
 
 
