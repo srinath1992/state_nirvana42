@@ -44,6 +44,12 @@ class SkipBlock(nn.Module):
         self.intermediate_dense = nn.Linear(in_features, in_features * 2, bias=True)
         self.dense = nn.Linear(in_features * 2, in_features, bias=True)
         self.activation = nn.ReLU()
+        # Channel gate to keep widened dims inert at initialization
+        self._old_d_model_gate = old_d_model if old_d_model is not None else in_features
+        gate_mask = torch.ones(in_features)
+        if old_d_model is not None and old_d_model < in_features:
+            gate_mask[old_d_model:] = 0.0
+        self.register_buffer("_gate_mask", gate_mask)
         if old_d_model is not None and old_d_model < in_features:
             self.layer_norm = AdapterLayerNorm(in_features, old_d_model)
         else:
@@ -54,7 +60,11 @@ class SkipBlock(nn.Module):
         x = self.intermediate_dense(x)
         x = self.activation(x)
         x = self.dense(x)
+        # Zero-out widened dimensions on the MLP path
+        x = x * self._gate_mask
         x = self.layer_norm(x + residual)
+        # Keep widened dims strictly zero on the residual stream at init
+        x = x * self._gate_mask
         return x
 
 
@@ -93,6 +103,12 @@ class StateEmbeddingModel(L.LightningModule):
         self.dropout = dropout
         self.max_lr = max_lr
         self.collater = collater
+        # Channel gate to keep widened dims inert at initialization
+        self._old_d_model_gate = min(d_model, 2048)
+        gate_mask = torch.ones(d_model)
+        if self._old_d_model_gate < d_model:
+            gate_mask[self._old_d_model_gate:] = 0.0
+        self.register_buffer("_gate_mask", gate_mask)
         # Encodes Tokens
         # Encoder block with optional LN adapter to preserve old LN stats when widened
         old_d_model = min(d_model, 2048)
@@ -302,7 +318,11 @@ class StateEmbeddingModel(L.LightningModule):
         Returns:
             output Tensor of shape [batch_size, seq_len, ntoken]
         """
-        src = self.encoder(src) * math.sqrt(self.d_model)
+        # Preserve baseline magnitude on the old subspace by using sqrt(old_d_model)
+        old_d_model = self._old_d_model_gate
+        src = self.encoder(src) * math.sqrt(old_d_model)
+        # Zero-out widened dimensions before entering the transformer stack
+        src = src * self._gate_mask
         if counts is not None:
             # scFoundation-style soft binning for counts
             counts = counts.unsqueeze(-1)  # now B x H x 1
@@ -327,6 +347,8 @@ class StateEmbeddingModel(L.LightningModule):
             src = (
                 src + count_emb
             )  # should both be B x H x self.d_model, or B x H + 1 x self.d_model if dataset correction
+            # Re-apply gating after adding count embeddings to keep widened dims inert
+            src = src * self._gate_mask
 
         output = self.transformer_encoder(src, src_key_padding_mask=None)
         gene_output = self.decoder(output)  # batch x seq_len x 128
