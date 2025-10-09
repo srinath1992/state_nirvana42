@@ -69,7 +69,10 @@ class FlashTransformerEncoderLayer(nn.Module):
             dropout (float): dropout probability.
         """
         super().__init__()
-        torch.backends.cuda.enable_flash_sdp(True)
+        # Prefer deterministic math-based SDPA to minimize numeric drift across shapes
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
+        torch.backends.cuda.enable_math_sdp(True)
 
         self.d_model = d_model
         self.nhead = nhead
