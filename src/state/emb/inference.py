@@ -169,17 +169,21 @@ class Inference:
         protein_embeds = torch.stack(protein_embeds).to(self.model.device, dtype=layer_weight_dtype)
         return self.model.gene_embedding_layer(protein_embeds)
 
-    def encode(self, dataloader, rda=None):
+    def encode(self, dataloader, rda=None, use_autocast: bool = True, autocast_dtype: torch.dtype | None = None):
         with torch.no_grad():
             device_type = "cuda" if torch.cuda.is_available() else "cpu"
-            precision = get_precision_config(device_type=device_type)
-            with torch.autocast(device_type=device_type, dtype=precision):
+            precision = autocast_dtype if autocast_dtype is not None else get_precision_config(device_type=device_type)
+            ctx = torch.autocast(device_type=device_type, dtype=precision) if use_autocast else torch.autocast(device_type=device_type, enabled=False)
+            with ctx:
                 for i, batch in enumerate(dataloader):
                     _, _, _, emb, ds_emb = self.model._compute_embedding_for_batch(batch)
-                    embeddings = emb.detach().cpu().float().numpy()
+                    embeddings = emb.detach().to("cpu", dtype=torch.float32).numpy()
 
-                    ds_emb = self.model.dataset_embedder(ds_emb)
-                    ds_embeddings = ds_emb.detach().cpu().float().numpy()
+                    # Dataset embedding path may be None if dataset correction disabled
+                    ds_embeddings = None
+                    if ds_emb is not None and hasattr(self.model, 'dataset_embedder') and self.model.dataset_embedder is not None:
+                        ds_emb = self.model.dataset_embedder(ds_emb)
+                        ds_embeddings = ds_emb.detach().to("cpu", dtype=torch.float32).numpy()
 
                     yield embeddings, ds_embeddings
 
@@ -193,6 +197,7 @@ class Inference:
         lancedb_path: str | None = None,
         update_lancedb: bool = False,
         lancedb_batch_size: int = 1000,
+        export_fp32: bool = False,
     ):
         shape_dict = self.__load_dataset_meta(input_adata_path)
         adata = anndata.read_h5ad(input_adata_path)
@@ -240,7 +245,20 @@ class Inference:
 
         all_embeddings = []
         all_ds_embeddings = []
-        for embeddings, ds_embeddings in tqdm(self.encode(dataloader), total=len(dataloader), desc="Encoding"):
+        # Configure export numerics: disable autocast and force FP32 on GPU if requested
+        if export_fp32 and torch.cuda.is_available():
+            torch.backends.cuda.matmul.allow_tf32 = False
+            try:
+                torch.set_float32_matmul_precision('high')
+            except Exception:
+                pass
+        use_autocast = not (export_fp32 and torch.cuda.is_available())
+        autocast_dtype = torch.float32 if (export_fp32 and torch.cuda.is_available()) else None
+
+        for embeddings, ds_embeddings in tqdm(
+            self.encode(dataloader, use_autocast=use_autocast, autocast_dtype=autocast_dtype),
+            total=len(dataloader), desc="Encoding"
+        ):
             all_embeddings.append(embeddings)
             if ds_embeddings is not None:
                 all_ds_embeddings.append(ds_embeddings)
