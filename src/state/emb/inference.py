@@ -229,6 +229,10 @@ class Inference:
                 except Exception:
                     log.warning("Failed to override batch size; using config default")
 
+        # Force FP32 batches during export on GPU to avoid dtype mismatches
+        if export_fp32 and torch.cuda.is_available():
+            precision = torch.float32
+
         dataloader = create_dataloader(
             dataloader_cfg,
             adata=adata,
@@ -248,6 +252,11 @@ class Inference:
             torch.backends.cuda.matmul.allow_tf32 = False
             try:
                 torch.set_float32_matmul_precision('high')
+            except Exception:
+                pass
+            # Ensure model parameters and buffers are FP32 for matmul dtype consistency
+            try:
+                self.model = self.model.to(dtype=torch.float32)
             except Exception:
                 pass
         use_autocast = not (export_fp32 and torch.cuda.is_available())
