@@ -38,24 +38,10 @@ class AdapterLayerNorm(nn.Module):
         if self.d_model == self.old_d_model:
             return norm_old
 
-        # Build full weight/bias-expanded affine for new dims
-        w = self.ln.weight
-        b = self.ln.bias
-
-        # Compute mean/var over old dims and apply to new dims using same stats
-        mu = x_old.mean(dim=-1, keepdim=True)
-        var = x_old.var(dim=-1, unbiased=False, keepdim=True)
-        x_new = x[..., self.old_d_model :]
-        x_new_norm = (x_new - mu) / torch.sqrt(var + self.ln.eps)
-
-        # Affine for new dims: replicate source indices' (w, b)
-        if self._dup_src_idx.numel() > 0:
-            w_new = w[self._dup_src_idx]
-            b_new = b[self._dup_src_idx]
-            out_new = x_new_norm.mul(w_new).add(b_new)
-            return torch.cat([norm_old, out_new], dim=-1)
-        else:
-            return norm_old
+        # Strict widening invariant: keep widened dims inert (zeros) at LN output.
+        # This ensures zero tails pre-gating and prevents any accidental residual leakage.
+        zeros_new = torch.zeros_like(x[..., self.old_d_model :])
+        return torch.cat([norm_old, zeros_new], dim=-1)
 
 
 class FlashTransformerEncoderLayer(nn.Module):
