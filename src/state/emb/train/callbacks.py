@@ -190,12 +190,17 @@ class CumulativeFLOPSCallback(L.Callback):
             return
 
         model = pl_module
-
         def forward_fn():
             return self._trainstep_forward_backward(model, batch)
 
-        self._flops_per_batch = int(measure_flops(model, forward_fn=forward_fn))
-        logger.info(f"CumulativeFLOPSCallback: Measured FLOPs per batch: {self._flops_per_batch}")
+        # Be resilient to OOM during FLOPs measurement (can spike memory use with SDPA)
+        try:
+            self._flops_per_batch = int(measure_flops(model, forward_fn=forward_fn))
+            logger.info(f"CumulativeFLOPSCallback: Measured FLOPs per batch: {self._flops_per_batch}")
+        except RuntimeError as e:
+            # Commonly torch.OutOfMemoryError (subclass of RuntimeError); skip FLOPs measurement
+            logger.warning(f"CumulativeFLOPSCallback: Skipping FLOPs measurement due to error: {e}")
+            self._flops_per_batch = None
 
         model.zero_grad(set_to_none=True)
         self._measured = True
