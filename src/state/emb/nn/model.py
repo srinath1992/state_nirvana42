@@ -233,18 +233,18 @@ class StateEmbeddingModel(L.LightningModule):
             pass
 
     def _compute_embedding_for_batch(self, batch):
-        batch_sentences = batch[0].to(self.device)
-        X = batch[1].to(self.device)
+        batch_sentences = batch[0].to(self.device, non_blocking=True)
+        X = batch[1].to(self.device, non_blocking=True)
         Y = batch[2]
         batch_weights = batch[4]
         mask = batch[5]
         mask = mask.to(torch.bool)
         batch_sentences_counts = batch[7]
         if batch_sentences_counts is not None:
-            batch_sentences_counts = batch_sentences_counts.to(self.device)
+            batch_sentences_counts = batch_sentences_counts.to(self.device, non_blocking=True)
         dataset_nums = batch[8]
         if dataset_nums is not None:
-            dataset_nums = dataset_nums.to(self.device)
+            dataset_nums = dataset_nums.to(self.device, non_blocking=True)
 
         # convert the cell sentence and task sentence into embeddings
         batch_sentences = self.pe_embedding(batch_sentences)
@@ -493,9 +493,33 @@ class StateEmbeddingModel(L.LightningModule):
         self.log("validation/val_loss", loss)
         return loss
 
+    def on_before_optimizer_step(self, optimizer):
+        """
+        Manual gradient clipping compatible with fused AdamW.
+        Keep trainer.gradient_clip_val at 0.0 to avoid Lightning's AMP plugin clipping,
+        which is incompatible with fused optimizers.
+        """
+        try:
+            max_norm = float(getattr(self.cfg.optimizer, "max_grad_norm", 0.0))
+        except Exception:
+            max_norm = 0.0
+        if max_norm and max_norm > 0.0:
+            params = [p for p in self.parameters() if p.grad is not None]
+            if params:
+                torch.nn.utils.clip_grad_norm_(params, max_norm)
+
     def configure_optimizers(self):
         max_lr = self.max_lr
-        optimizer = torch.optim.AdamW(self.parameters(), lr=max_lr, weight_decay=self.cfg.optimizer.weight_decay)
+        # Prefer fused AdamW on CUDA for better throughput; fallback if unsupported.
+        try:
+            optimizer = torch.optim.AdamW(
+                self.parameters(),
+                lr=max_lr,
+                weight_decay=self.cfg.optimizer.weight_decay,
+                fused=True,
+            )
+        except TypeError:
+            optimizer = torch.optim.AdamW(self.parameters(), lr=max_lr, weight_decay=self.cfg.optimizer.weight_decay)
         total_steps = self.trainer.estimated_stepping_batches * 2  # not sure why need to do this
 
         lr_schedulers = [

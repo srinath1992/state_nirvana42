@@ -18,7 +18,7 @@ experiment:
   limit_val_batches: 100
   ddp_timeout: 3600
   checkpoint:
-    path: /scratch/ctc/ML/vci/checkpoint/pretrain
+    path: /workspace/state/checkpoints
     save_top_k: 4
     monitor: trainer/train_loss
     every_n_train_steps: 1000
@@ -91,6 +91,12 @@ embeddings:
     all_embeddings: /home/aadduri/state/SE-167M-Data/all_embeddings_SE-167M.pt
     ds_emb_mapping: /home/aadduri/state/SE-167M-Data/ds_emb_mapping_SE-167M.torch
     valid_genes_masks: /home/aadduri/state/SE-167M-Data/valid_genes_masks_SE-167M.torch
+    size: 5120
+    num: 19790
+  vcc_comp:
+    all_embeddings: /workspace/state/emb_profiles/vcc_comp/all_embeddings_vcc_comp.pt
+    ds_emb_mapping: /workspace/state/emb_profiles/vcc_comp/ds_emb_mapping_vcc_comp.torch
+    valid_genes_masks: /workspace/state/emb_profiles/vcc_comp/valid_genes_masks_vcc_comp.torch
     size: 5120
     num: 19790
 validations:
@@ -202,6 +208,12 @@ dataset:
     val: /home/aadduri/state/SE-167M-Data/val_SE-167M.csv
     filter: true
     num_datasets: 14418
+  vcc_comp:
+    ds_type: h5ad
+    train: /workspace/state/emb_profiles/vcc_comp/train_vcc_comp.csv
+    val: /workspace/state/emb_profiles/vcc_comp/val_vcc_comp.csv
+    filter: true
+    num_datasets: 5
 tokenizer:
   token_dim: 5120
 model:

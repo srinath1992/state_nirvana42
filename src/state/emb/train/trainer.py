@@ -29,7 +29,6 @@ def get_embeddings(cfg):
     if isinstance(all_pe, dict):
         all_pe = torch.vstack(list(all_pe.values()))
 
-    all_pe = all_pe.cuda()
     return all_pe
 
 
@@ -37,7 +36,21 @@ def main(cfg):
     print(f"Starting training with Embedding {cfg.embeddings.current} and dataset {cfg.dataset.current}")
     os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
     os.environ["NCCL_LAUNCH_TIMEOUT"] = str(cfg.experiment.ddp_timeout)
-    os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "1"
+    # Prefer the new Torch env var to avoid deprecation warnings
+    os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "1"
+    # Improve Tensor Core utilization on H200
+    try:
+        torch.set_float32_matmul_precision("high")
+        # Enable TF32 on matmul to maximize tensor core usage where applicable
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+    except Exception:
+        pass
+    try:
+        # Align thread count with container setting if available
+        torch.set_num_threads(int(os.environ.get("OMP_NUM_THREADS", "16")))
+    except Exception:
+        pass
     TOTAL_N_CELL = cfg.dataset.num_cells
     EPOCH_LENGTH = int(TOTAL_N_CELL // cfg.model.batch_size // 24)
     # ? not sure why this needs to be included but seems empirical?? no clue why this is 6
@@ -65,7 +78,7 @@ def main(cfg):
         num_workers=cfg.dataset.num_train_workers,
         persistent_workers=True,
         pin_memory=True,
-        prefetch_factor=4,
+        prefetch_factor=8,
         generator=generator,
     )
 
@@ -89,7 +102,7 @@ def main(cfg):
         output_dim=cfg.model.output_dim,
         dropout=cfg.model.dropout,
         warmup_steps=warmup_steps,
-        compiled=False,
+        compiled=bool(getattr(cfg.experiment, "compiled", False)),
         max_lr=cfg.optimizer.max_lr,
         emb_size=get_embedding_cfg(cfg).size,
         collater=val_dataset_sentence_collator,
@@ -104,13 +117,20 @@ def main(cfg):
     val_dataset_sentence_collator.cfg = cfg
     model.collater = val_dataset_sentence_collator
     model = model.cuda()
-    all_pe = get_embeddings(cfg)
-    all_pe.requires_grad = False
-    model.pe_embedding = nn.Embedding.from_pretrained(all_pe)
+    all_pe = get_embeddings(cfg)  # keep on CPU to avoid duplicating on GPU
+    model.pe_embedding = nn.Embedding.from_pretrained(all_pe, freeze=True).cuda()
+    del all_pe
+    try:
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
 
     model = model.train()
 
     run_name, chk = get_latest_checkpoint(cfg)
+    # Avoid resuming when compiled graph setting changes the module hierarchy
+    if bool(getattr(cfg.experiment, "compiled", False)):
+        chk = None
     checkpoint_callback = ModelCheckpoint(
         every_n_train_steps=cfg.experiment.checkpoint.every_n_train_steps,
         dirpath=os.path.join(cfg.experiment.checkpoint.path, cfg.experiment.name),
@@ -159,12 +179,15 @@ def main(cfg):
         devices=cfg.experiment.num_gpus_per_node,
         num_nodes=cfg.experiment.num_nodes,
         # Accumulation
-        gradient_clip_val=cfg.optimizer.max_grad_norm,
+        # Use manual clipping in the LightningModule hook to support fused optimizers
+        gradient_clip_val=0.0,
         accumulate_grad_batches=cfg.optimizer.gradient_accumulation_steps,
         precision="bf16-mixed",
         strategy=DDPStrategy(
             process_group_backend="nccl",
-            find_unused_parameters=False,
+            find_unused_parameters=bool(getattr(cfg.experiment, "find_unused_parameters", False)),
+            gradient_as_bucket_view=True,
+            static_graph=False,
             timeout=timedelta(seconds=cfg.experiment.get("ddp_timeout", 3600)),
         ),
         val_check_interval=val_interval,
