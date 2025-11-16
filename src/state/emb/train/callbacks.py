@@ -9,6 +9,26 @@ from lightning.fabric.utilities.throughput import measure_flops
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
+class RegFreezeCallback(L.Callback):
+    def __init__(self, warmup_steps: int, freeze_after_warmup: bool = True):
+        super().__init__()
+        self.warmup_steps = int(warmup_steps)
+        self.freeze_after_warmup = bool(freeze_after_warmup)
+        self._frozen = False
+
+    def on_train_batch_end(self, trainer: L.Trainer, pl_module: L.LightningModule, outputs, batch, batch_idx):
+        if not self.freeze_after_warmup or self._frozen:
+            return
+        if trainer.global_step >= self.warmup_steps and getattr(pl_module, "reg_enabled", False):
+            # Freeze only the projector by default; LN/Dropout have no params/low risk
+            reg_proj = getattr(pl_module, "reg_proj", None)
+            if reg_proj is not None:
+                for p in reg_proj.parameters():
+                    p.requires_grad = False
+            self._frozen = True
+            if trainer.logger is not None:
+                trainer.logger.log_metrics({"se_reg/frozen": 1, "se_reg/freeze_step": trainer.global_step}, step=trainer.global_step)
+
 
 class LogLR(L.Callback):
     def __init__(self, interval=10):
@@ -169,6 +189,7 @@ class CumulativeFLOPSCallback(L.Callback):
         self._measured: bool = False
         self._cumulative_flops: int = 0
         self._batch_count: int = 0
+        self._last_batch_start_time: Optional[float] = None
 
     def _trainstep_forward_backward(self, model: L.LightningModule, batch: Any) -> torch.Tensor:
         """Encapsulate calling StateEmbeddingModel.training_step and backward.
@@ -208,6 +229,8 @@ class CumulativeFLOPSCallback(L.Callback):
     def on_train_batch_start(self, trainer: L.Trainer, pl_module: Any, batch: dict, batch_idx: int) -> None:
         if not self._measured and batch_idx == 0 and trainer.current_epoch == 0:
             self._measure_flops_once(trainer, pl_module, batch)
+        # mark start time to compute step time
+        self._last_batch_start_time = time.time()
 
     def on_train_batch_end(self, trainer: L.Trainer, pl_module: Any, outputs: Any, batch: dict, batch_idx: int) -> None:
         if self._flops_per_batch is None:
@@ -225,6 +248,19 @@ class CumulativeFLOPSCallback(L.Callback):
             on_epoch=False,
             sync_dist=True,
         )
+        # Also compute MFU if timing is available
+        try:
+            if self._last_batch_start_time is not None:
+                step_time = max(1e-6, time.time() - self._last_batch_start_time)
+                # Read peak TFLOPs from config if present; default to 989 TFLOPs for H200 (bf16)
+                peak_tflops = float(getattr(getattr(pl_module, "cfg", {}).experiment, "peak_tflops_bf16", 989))
+                peak_flops_per_gpu = peak_tflops * 1e12
+                mfu = float(self._flops_per_batch) / (peak_flops_per_gpu * step_time)
+                # Clamp to [0,1] for sanity
+                mfu = max(0.0, min(1.0, mfu))
+                trainer.logger.log_metrics({"perf/mfu": mfu}, step=trainer.global_step)
+        except Exception as e:
+            logger.debug(f"MFU logging skipped due to error: {e}")
 
     def on_validation_start(self, trainer: L.Trainer, pl_module: Any) -> None:
         if self._flops_per_batch is None:
