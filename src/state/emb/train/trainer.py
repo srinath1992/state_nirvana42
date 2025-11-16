@@ -19,6 +19,7 @@ from ..train.callbacks import (
     EMACallback,
     PerfProfilerCallback,
     CumulativeFLOPSCallback,
+    RegFreezeCallback,
 )
 from ..utils import get_latest_checkpoint, get_embedding_cfg, get_dataset_cfg
 
@@ -165,6 +166,9 @@ def main(cfg):
 
     # Add cumulative FLOPS callback
     callbacks.append(CumulativeFLOPSCallback(use_backward=cfg.experiment.cumulative_flops_use_backward))
+    # If regulatory channel is enabled, add warmup->freeze
+    if getattr(cfg, "se", None) is not None and bool(getattr(cfg.se, "use_gene_reg", False)):
+        callbacks.append(RegFreezeCallback(warmup_steps=int(cfg.se.warmup_steps), freeze_after_warmup=bool(cfg.se.freeze_after_warmup)))
 
     max_steps = -1
     if cfg.experiment.profile.enable_profiler:
@@ -201,6 +205,20 @@ def main(cfg):
         print(f"******** Loading chkpoint {run_name} {chk}...")
     else:
         print(f"******** Initialized fresh {run_name}...")
+
+    # Log SE regulatory settings once at start
+    try:
+        if cfg.wandb.enable and hasattr(trainer, "logger") and trainer.logger is not None and getattr(cfg, "se", None) is not None:
+            trainer.logger.log_metrics(
+                {
+                    "se_reg/active": int(bool(getattr(cfg.se, "use_gene_reg", False))),
+                    "se_reg/dropout": float(getattr(cfg.se.gene_reg, "dropout", 0.1)) if hasattr(cfg.se, "gene_reg") else 0.0,
+                    "se_reg/warmup_steps": int(getattr(cfg.se, "warmup_steps", 0)),
+                },
+                step=0,
+            )
+    except Exception:
+        pass
 
     trainer.fit(model=model, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader, ckpt_path=chk)
 

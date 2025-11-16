@@ -14,14 +14,16 @@ experiment:
   num_nodes: 1
   num_gpus_per_node: 1
   port: 12400
-  val_check_interval: 1000
-  limit_val_batches: 100
+  seed: 42
+  val_check_interval: 500
+  limit_val_batches: 1.0
   ddp_timeout: 3600
+  peak_tflops_bf16: 989
   checkpoint:
     path: /workspace/state/checkpoints
     save_top_k: 4
     monitor: trainer/train_loss
-    every_n_train_steps: 1000
+    every_n_train_steps: 2500
 wandb:
   enable: true
   project: vci
@@ -118,7 +120,7 @@ validations:
     dataset_name: rpe1_top5000_variable
 dataset:
   name: vci
-  seed: 42
+  seed: ${experiment.seed}
   num_train_workers: 16
   num_val_workers: 4
   current: cellxgene
@@ -252,3 +254,11 @@ loss:
   apply_normalization: false
   kernel: energy
   uniformity: false
+se:
+  use_gene_reg: false
+  gene_reg_feature_file: /workspace/tree_of_life_extract/fusion_full_layer9/fusion_data/se_gene_reg_features.pt
+  gene_reg_dim: 32
+  gene_reg:
+    dropout: 0.1
+  warmup_steps: 2000
+  freeze_after_warmup: true

@@ -25,6 +25,7 @@ from ..utils import (
     get_dataset_cfg,
 )
 from .loss import WassersteinLoss, KLDivergenceLoss, MMDLoss, TabularLoss
+from ..utils_gene_reg import build_gene_reg_table
 
 
 from .flash_transformer import FlashTransformerEncoderLayer
@@ -170,6 +171,28 @@ class StateEmbeddingModel(L.LightningModule):
         self.pe_embedding = (
             None  # TODO: make this cleaner for the type checker, right now it gets set externally after model init
         )
+        # Optional regulatory 32D channel
+        self.reg_enabled = False
+        self.reg_embedding = None
+        self.reg_ln = None
+        self.reg_drop = None
+        self.reg_proj = None
+        try:
+            if self.cfg is not None and bool(getattr(self.cfg.se, "use_gene_reg", False)):
+                self.reg_enabled = True
+                reg_table = build_gene_reg_table(self.cfg)  # [num_tokens, reg_dim]
+                self.reg_embedding = nn.Embedding.from_pretrained(reg_table, freeze=True)
+                reg_dim = int(self.cfg.se.gene_reg_dim)
+                self.reg_ln = nn.LayerNorm(reg_dim)
+                self.reg_drop = nn.Dropout(float(getattr(self.cfg.se.gene_reg, "dropout", 0.1)))
+                self.reg_proj = nn.Linear(reg_dim, d_model, bias=True)
+        except Exception:
+            # Fail-safe: do not block model construction if optional channel fails
+            self.reg_enabled = False
+            self.reg_embedding = None
+            self.reg_ln = None
+            self.reg_drop = None
+            self.reg_proj = None
         self.step_ctr = 0
 
         self.true_top_genes = None
@@ -233,7 +256,7 @@ class StateEmbeddingModel(L.LightningModule):
             pass
 
     def _compute_embedding_for_batch(self, batch):
-        batch_sentences = batch[0].to(self.device, non_blocking=True)
+        batch_sentences_indices = batch[0].to(self.device, non_blocking=True)
         X = batch[1].to(self.device, non_blocking=True)
         Y = batch[2]
         batch_weights = batch[4]
@@ -247,7 +270,7 @@ class StateEmbeddingModel(L.LightningModule):
             dataset_nums = dataset_nums.to(self.device, non_blocking=True)
 
         # convert the cell sentence and task sentence into embeddings
-        batch_sentences = self.pe_embedding(batch_sentences)
+        batch_sentences = self.pe_embedding(batch_sentences_indices)
         X = self.pe_embedding(X)
 
         # Normalize token outputs now
@@ -265,7 +288,7 @@ class StateEmbeddingModel(L.LightningModule):
 
         # mask out the genes embeddings that appear in the task sentence
         _, embedding, dataset_emb = self.forward(
-            batch_sentences, mask=mask, counts=batch_sentences_counts, dataset_nums=dataset_nums
+            batch_sentences, mask=mask, counts=batch_sentences_counts, dataset_nums=dataset_nums, token_indices=batch_sentences_indices
         )
 
         X = self.gene_embedding_layer(X)
@@ -311,7 +334,7 @@ class StateEmbeddingModel(L.LightningModule):
 
         return combine
 
-    def forward(self, src: Tensor, mask: Tensor, counts=None, dataset_nums=None):
+    def forward(self, src: Tensor, mask: Tensor, counts=None, dataset_nums=None, token_indices: Tensor | None = None):
         """
         Args:
             src: Tensor, shape [batch_size, seq_len, ntoken]
@@ -323,6 +346,17 @@ class StateEmbeddingModel(L.LightningModule):
         src = self.encoder(src) * math.sqrt(old_d_model)
         # Zero-out widened dimensions before entering the transformer stack
         src = src * self._gate_mask
+        # Add optional regulatory channel (aligned by token indices)
+        if self.reg_enabled and token_indices is not None and self.reg_embedding is not None:
+            try:
+                reg = self.reg_embedding(token_indices.to(self.device))
+                reg = self.reg_ln(reg)
+                reg = self.reg_drop(reg)
+                reg = self.reg_proj(reg)
+                src = src + reg
+                src = src * self._gate_mask
+            except Exception:
+                pass
         if counts is not None:
             # scFoundation-style soft binning for counts
             counts = counts.unsqueeze(-1)  # now B x H x 1
@@ -541,3 +575,8 @@ class StateEmbeddingModel(L.LightningModule):
     def update_config(self, new_cfg):
         """Update the model's config after loading from checkpoint."""
         self.cfg = new_cfg
+        # Re-evaluate reg_enabled in case config changed between runs
+        try:
+            self.reg_enabled = bool(getattr(self.cfg.se, "use_gene_reg", False))
+        except Exception:
+            self.reg_enabled = False
