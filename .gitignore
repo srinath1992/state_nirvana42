@@ -12,3 +12,7 @@ notebooks/
 *.slurm
 temp
 wandb/
+
+# Training artifacts - large files
+checkpoints/
+emb_profiles/
