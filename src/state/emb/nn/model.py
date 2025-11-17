@@ -545,15 +545,52 @@ class StateEmbeddingModel(L.LightningModule):
     def configure_optimizers(self):
         max_lr = self.max_lr
         # Prefer fused AdamW on CUDA for better throughput; fallback if unsupported.
+        # Build optimizer with optional separate LR/WD for regulatory projector
         try:
-            optimizer = torch.optim.AdamW(
-                self.parameters(),
-                lr=max_lr,
-                weight_decay=self.cfg.optimizer.weight_decay,
-                fused=True,
+            reg_enabled = bool(getattr(self.cfg.se, "use_gene_reg", False))
+        except Exception:
+            reg_enabled = False
+
+        param_groups = []
+        try:
+            all_params = list(self.parameters())
+            reg_params = list(self.reg_proj.parameters()) if (reg_enabled and getattr(self, "reg_proj", None) is not None) else []
+            reg_param_ids = {id(p) for p in reg_params}
+            backbone_params = [p for p in all_params if id(p) not in reg_param_ids]
+        except Exception:
+            backbone_params = list(self.parameters())
+            reg_params = []
+
+        # Backbone param group
+        param_groups.append(
+            {
+                "params": backbone_params,
+                "lr": max_lr,
+                "weight_decay": self.cfg.optimizer.weight_decay,
+            }
+        )
+        # Optional regulatory projector param group
+        if reg_params:
+            try:
+                reg_lr = float(getattr(self.cfg.se.gene_reg, "lr", None)) if hasattr(self.cfg.se, "gene_reg") else None
+            except Exception:
+                reg_lr = None
+            try:
+                reg_wd = float(getattr(self.cfg.se.gene_reg, "weight_decay", None)) if hasattr(self.cfg.se, "gene_reg") else None
+            except Exception:
+                reg_wd = None
+            param_groups.append(
+                {
+                    "params": reg_params,
+                    "lr": reg_lr if reg_lr is not None else max_lr,
+                    "weight_decay": reg_wd if reg_wd is not None else self.cfg.optimizer.weight_decay,
+                }
             )
+
+        try:
+            optimizer = torch.optim.AdamW(param_groups, fused=True)
         except TypeError:
-            optimizer = torch.optim.AdamW(self.parameters(), lr=max_lr, weight_decay=self.cfg.optimizer.weight_decay)
+            optimizer = torch.optim.AdamW(param_groups)
         total_steps = self.trainer.estimated_stepping_batches * 2  # not sure why need to do this
 
         lr_schedulers = [

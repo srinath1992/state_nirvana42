@@ -6,7 +6,7 @@ from torch import nn
 from torch.utils.data import DataLoader
 from datetime import timedelta
 
-from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping
 from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.strategies import DDPStrategy
 
@@ -20,6 +20,7 @@ from ..train.callbacks import (
     PerfProfilerCallback,
     CumulativeFLOPSCallback,
     RegFreezeCallback,
+    ProbeEvalCallback,
 )
 from ..utils import get_latest_checkpoint, get_embedding_cfg, get_dataset_cfg
 
@@ -139,6 +140,7 @@ def main(cfg):
         save_last=True,
         save_top_k=cfg.experiment.checkpoint.save_top_k,
         monitor=cfg.experiment.checkpoint.monitor,
+        mode="min",
     )
 
     if cfg.wandb.enable:
@@ -159,6 +161,19 @@ def main(cfg):
         exp_logger = None
 
     callbacks = [checkpoint_callback, LogLR(100), ResumeCallback(cfg), PerfProfilerCallback()]
+    # Early stopping on validation loss (recommended gate)
+    try:
+        early_stopping = EarlyStopping(
+            monitor="validation/val_loss",
+            mode="min",
+            patience=5,  # ~5 validations with default cadence
+            min_delta=0.0,
+            verbose=False,
+            check_finite=True,
+        )
+        callbacks.append(early_stopping)
+    except Exception:
+        pass
 
     if getattr(cfg.model, "ema", False):
         ema_decay = getattr(cfg.model, "ema_decay", 0.999)
@@ -169,11 +184,22 @@ def main(cfg):
     # If regulatory channel is enabled, add warmup->freeze
     if getattr(cfg, "se", None) is not None and bool(getattr(cfg.se, "use_gene_reg", False)):
         callbacks.append(RegFreezeCallback(warmup_steps=int(cfg.se.warmup_steps), freeze_after_warmup=bool(cfg.se.freeze_after_warmup)))
+    # Optional periodic probe metrics to W&B
+    try:
+        if hasattr(cfg, "validations") and (getattr(cfg.validations.diff_exp, "enable", False) or getattr(cfg.validations.perturbation, "enable", False)):
+            callbacks.append(ProbeEvalCallback(cfg))
+    except Exception:
+        pass
 
-    max_steps = -1
+    # Respect a direct max_steps if provided; otherwise fall back to profile settings.
+    try:
+        max_steps = int(getattr(cfg.experiment, "max_steps", -1))
+    except Exception:
+        max_steps = -1
     if cfg.experiment.profile.enable_profiler:
         callbacks.append(ProfilerCallback(cfg=cfg))
-        max_steps = cfg.experiment.profile.max_steps
+        if max_steps < 0:
+            max_steps = cfg.experiment.profile.max_steps
 
     val_interval = int(cfg.experiment.val_check_interval * cfg.experiment.num_gpus_per_node * cfg.experiment.num_nodes)
     trainer = L.Trainer(

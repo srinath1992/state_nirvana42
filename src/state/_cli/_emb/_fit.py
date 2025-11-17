@@ -32,6 +32,25 @@ def run_emb_fit(cfg, args):
         overrides = OmegaConf.from_dotlist(args.hydra_overrides)
         cfg = OmegaConf.merge(cfg, overrides)
 
+    # Normalize recommended alias keys for convenience:
+    # - training.max_steps -> experiment.max_steps
+    # - training.devices   -> experiment.num_gpus_per_node
+    # - training.strategy  -> (no-op; DDPStrategy used automatically)
+    # - output_dir         -> experiment.checkpoint.path
+    try:
+        if hasattr(cfg, "training"):
+            tr = cfg.training
+            if hasattr(tr, "max_steps") and tr.max_steps is not None:
+                cfg.experiment.max_steps = int(tr.max_steps)
+            if hasattr(tr, "devices") and tr.devices is not None:
+                cfg.experiment.num_gpus_per_node = int(tr.devices)
+            # strategy is informational; trainer selects DDPStrategy when multi-GPU
+        if hasattr(cfg, "output_dir") and cfg.output_dir is not None:
+            cfg.experiment.checkpoint.path = cfg.output_dir
+    except Exception:
+        # Do not block training if alias mapping fails
+        pass
+
     # Validate required configuration
     if cfg.embeddings.current is None:
         log.error("Gene embeddings are required for training. Please set 'embeddings.current'")
