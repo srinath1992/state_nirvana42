@@ -256,7 +256,13 @@ loss:
   uniformity: false
 se:
   use_gene_reg: false
-  gene_reg_feature_file: /workspace/tree_of_life_extract/fusion_full_layer9/fusion_data/se_gene_reg_features.pt
+  # Optional regulatory gene features (Tree-of-Life / Nirvana42 integration).
+  #
+  # IMPORTANT:
+  # - This is intentionally null by default to avoid hardcoding repo-specific paths.
+  # - If you enable `use_gene_reg: true`, you MUST set `gene_reg_feature_file` explicitly
+  #   to a torch file containing: dict[str(gene_name) -> FloatTensor[gene_reg_dim]].
+  gene_reg_feature_file: null
   gene_reg_dim: 32
   gene_reg:
     dropout: 0.1
